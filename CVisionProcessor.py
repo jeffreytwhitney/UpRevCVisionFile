@@ -1,0 +1,498 @@
+import os
+import pathlib
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path, WindowsPath
+from tkinter import messagebox, simpledialog
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+try:
+    import win32com.client
+except ImportError:  # pragma: no cover - only needed when AutoCAD COM is unavailable.
+    win32com = None
+
+REV_TEXT_PATTERN = re.compile(r"(?i)(?:^|[^A-Z])REV(?:[\s_-])?([A-Z])\s*$")
+_ACAD_APP = None
+
+
+def add_rev_table_entry(table, doc_rev_letter, manufacturing_rev_letter):
+    row_count = int(getattr(table, "Rows", 0))
+    last_data_row = find_last_data_row(table)
+
+    if last_data_row < 0:
+        insert_row_index = 0
+    else:
+        insert_row_index = last_data_row + 1
+
+    if insert_row_index >= row_count:
+        if hasattr(table, "InsertRows"):
+            table.InsertRows(row_count, 1)
+            insert_row_index = row_count
+        else:
+            raise AttributeError(f"Table object {type(table).__name__} does not support InsertRows.")
+
+    reference_height = None
+    reference_style = None
+    for row_index in range(0, max(1, insert_row_index + 1)):
+        for col_index in range(0, 4):
+            try:
+                height = get_table_cell_text_height(table, row_index, col_index)
+                if height is not None:
+                    reference_height = height
+                    reference_style = get_table_cell_style(table, row_index, col_index)
+                    break
+            except Exception:
+                pass
+        if reference_height is not None:
+            break
+
+    for col_index in range(0, 4):
+        value = ""
+        if col_index == 0:
+            value = doc_rev_letter
+        elif col_index == 1:
+            value = f"Up Rev to {manufacturing_rev_letter}. No chg."
+        elif col_index == 2:
+            value = "JTW"
+        elif col_index == 3:
+            value = datetime.now().strftime("%m/%d/%Y")
+        set_table_cell_text(table, insert_row_index, col_index, value)
+        if reference_style is not None:
+            set_table_cell_style(table, insert_row_index, col_index, reference_style)
+        elif reference_height is not None:
+            set_table_cell_text_height(table, insert_row_index, col_index, reference_height)
+
+    return insert_row_index
+
+
+def archive_dxf(filepath):
+    archive_filepath = get_file_archive_path(filepath)
+    incremented_filepath = get_incremented_file_path(filepath)
+
+    if os.path.exists(incremented_filepath):
+        messagebox.showerror("Error", f"File '{incremented_filepath}' already exists.")
+        return ""
+
+    if os.path.exists(archive_filepath):
+        user_response = messagebox.askyesno("Are You Sure?",
+                                            f"Directory '{archive_filepath}' already exists. Overwrite?")
+        if not user_response:
+            return ""
+    shutil.copy(filepath, archive_filepath)
+    os.rename(filepath, incremented_filepath)
+
+    return incremented_filepath
+
+
+def bump_rev_letter(letter):
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    index = alphabet.find(letter.upper())
+    if index < 0:
+        raise ValueError(f"Unsupported rev letter: {letter!r}")
+    next_letter = alphabet[(index + 1) % len(alphabet)]
+    return next_letter if letter.isupper() else next_letter.lower()
+
+
+def check_dxf(filepath):
+    has_rev_text = False
+    has_rev_table = False
+
+    acad = find_acad_application()
+    doc = acad.Documents.Open(filepath)
+    try:
+        for obj in iter_document_objects(doc):
+            try:
+                object_name = getattr(obj, "ObjectName", "")
+                if object_name.startswith("AcDbText") or object_name.startswith("AcDbMText"):
+                    text = get_object_text(obj)
+                    if extract_rev_suffix(text) is not None:
+                        has_rev_text = True
+                elif "Table" in object_name or hasattr(obj, "GetCell") or hasattr(obj, "Cells"):
+                    cell_text = get_table_cell_text(obj, 0, 0)
+                    if cell_text.upper() == "REV":
+                        has_rev_table = True
+            except Exception:
+                continue
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:
+            pass
+
+    return has_rev_text, has_rev_table
+
+
+def extract_rev_suffix(text):
+    match = REV_TEXT_PATTERN.search(text.strip())
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def find_acad_application():
+    global _ACAD_APP
+    if win32com is None:
+        raise RuntimeError("pywin32 is required to communicate with AutoCAD.")
+
+    if _ACAD_APP is not None:
+        try:
+            if hasattr(_ACAD_APP, "Documents"):
+                return _ACAD_APP
+        except Exception:
+            _ACAD_APP = None
+
+    for app_name in ("AutoCAD.Application", "AutoCAD.Application.25.1"):
+        try:
+            app = win32com.client.GetActiveObject(app_name)
+            if hasattr(app, "Documents"):
+                _ACAD_APP = app
+                return _ACAD_APP
+        except Exception:
+            pass
+
+    for app_name in ("AutoCAD.Application", "AutoCAD.Application.25.1"):
+        try:
+            app = win32com.client.Dispatch(app_name)
+            if hasattr(app, "Documents"):
+                _ACAD_APP = app
+                return _ACAD_APP
+        except Exception:
+            pass
+
+    raise RuntimeError("AutoCAD is not running, and a new instance could not be started.")
+
+
+def find_last_data_row(table):
+    if not hasattr(table, "Rows") or not hasattr(table, "Columns"):
+        return -1
+
+    row_count = int(getattr(table, "Rows", 0))
+    column_count = int(getattr(table, "Columns", 0))
+
+    for row_index in range(row_count - 1, -1, -1):
+        for col_index in range(column_count):
+            try:
+                cell_text = get_table_cell_text(table, row_index, col_index)
+            except Exception:
+                continue
+            if cell_text:
+                return row_index
+    return -1
+
+
+def find_rev_table(doc):
+    candidates = []
+    for obj in iter_document_objects(doc):
+        try:
+            object_name = str(getattr(obj, "ObjectName", ""))
+            if "Table" in object_name or hasattr(obj, "GetCell") or hasattr(obj, "Cells"):
+                candidates.append(object_name or type(obj).__name__)
+                if "Table" not in object_name:
+                    continue
+                cell_text = get_table_cell_text(obj, 0, 0)
+                if cell_text.upper() == "REV":
+                    return obj
+        except Exception:
+            continue
+
+    return None
+
+
+def get_incremented_file_path(source_filepath):
+    source_path = WindowsPath(source_filepath)
+    root_filename = source_path.stem[:len(source_path.stem) - 1]
+    file_extension = source_path.suffix
+    current_file_suffix = source_path.stem[-1]
+    while True:
+        incremented_file_suffix = get_incremented_file_suffix(current_file_suffix)
+        incremented_filename = root_filename + incremented_file_suffix + file_extension
+        incremented_filepath = source_path.with_name(incremented_filename)
+        if not os.path.exists(incremented_filepath):
+            return_path = incremented_filepath
+            break
+        else:
+            current_file_suffix = incremented_file_suffix
+    return return_path
+
+
+def get_file_archive_path(source_filepath):
+    output_path_root = r"V:\Inspect Programs\C-Vision\Archived DXFs"
+    return pathlib.Path.joinpath(pathlib.WindowsPath(output_path_root), pathlib.WindowsPath(source_filepath).name)
+
+
+def get_incremented_file_suffix(file_suffix):
+    return_value = chr(ord(file_suffix) + 1)
+    if return_value == "[":
+        return_value = "AA"
+    return return_value
+
+
+def get_max_table_rev_letter(table):
+    row_count = int(getattr(table, "Rows", 0))
+    max_letter = None
+
+    for row_index in range(0, row_count):
+        value = get_table_cell_text(table, row_index, 0)
+        if not value:
+            continue
+        if value.strip().upper() == "REV":
+            continue
+        match = re.search(r"(?i)(?:^|[\s_])?([A-Z])$", value.strip())
+        if not match:
+            continue
+        letter = match.group(1).upper()
+        if max_letter is None or letter > max_letter:
+            max_letter = letter
+
+    return max_letter
+
+
+def get_object_text(obj):
+    for attribute in ("TextString", "Text", "Contents"):
+        value = getattr(obj, attribute, None)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def get_table_cell_style(table, row, col):
+    method = getattr(table, "GetCellStyle", None)
+    if method is None:
+        return None
+    try:
+        return method(row, col)
+    except Exception:
+        return None
+
+
+def get_table_cell_text(table, row, col):
+    for method_name in ("GetCellValue", "GetCellText", "GetCell", "Cell"):
+        method = getattr(table, method_name, None)
+        if method is None:
+            continue
+        try:
+            value = method(row, col)
+            if value is None:
+                continue
+            return str(value).strip()
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+    return ""
+
+
+def get_table_cell_text_height(table, row, col):
+    method = getattr(table, "GetCellTextHeight", None)
+    if method is None:
+        return None
+    try:
+        return float(method(row, col))
+    except Exception:
+        return None
+
+
+def iter_document_objects(doc):
+    for container_name in ("ModelSpace", "PaperSpace"):
+        container = getattr(doc, container_name, None)
+        if container is None:
+            continue
+        try:
+            for obj in container:
+                yield obj
+        except Exception:
+            pass
+
+    blocks = getattr(doc, "Blocks", None)
+    if blocks is None:
+        return
+    try:
+        for block in blocks:
+            try:
+                entities = getattr(block, "Entities", None)
+                if entities is None:
+                    continue
+                for obj in entities:
+                    yield obj
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def normalize_rev_name(rev_name):
+    if rev_name is None:
+        raise ValueError("A new rev name is required.")
+
+    cleaned = str(rev_name).strip()
+    if not cleaned:
+        raise ValueError("A new rev name is required.")
+
+    cleaned = re.sub(r"(?i)^REV[\s_-]*", "", cleaned)
+    cleaned = cleaned.strip()
+    if not re.fullmatch(r"[A-Z]", cleaned.upper()):
+        raise ValueError(f"Unsupported rev name: {rev_name!r}. Use a single letter such as A, B, or C.")
+
+    return cleaned.upper()
+
+
+def replace_rev_suffix(text, old_letter, new_letter):
+    match = re.search(r"(?i)(REV)([\s_-]?)\s*([A-Z])\s*$", text)
+    if match is None:
+        pattern = re.compile(rf"(?i)(REV)(?:[\s_-])?{re.escape(old_letter)}\s*$")
+        return pattern.sub(lambda match: f"{match.group(1)} {new_letter}", text, count=1)
+
+    separator = match.group(2) or " "
+    return re.sub(r"(?i)(REV)([\s_-]?)\s*[A-Z]\s*$", rf"\1{separator}{new_letter}", text, count=1)
+
+
+def save_document(doc, filepath):
+    file_path = Path(filepath)
+    temp_dir = file_path.parent
+    stem = file_path.stem.replace(" ", "_")
+    temp_name = f"{stem}_uprev_{datetime.now().strftime('%Y%m%d%H%M%S')}{file_path.suffix}"
+    temp_path = temp_dir / temp_name
+
+    try:
+        doc.SaveAs(str(temp_path))
+        try:
+            doc.Close(False)
+        except Exception:
+            pass
+        if temp_path.exists():
+            os.replace(str(temp_path), str(file_path))
+        return
+    except Exception as exc:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"Unable to save the DXF file '{filepath}'. AutoCAD rejected the save. Original error: {exc}"
+        ) from exc
+
+
+def set_object_text(obj, new_text):
+    for attribute in ("TextString", "Text", "Contents"):
+        if hasattr(obj, attribute):
+            setattr(obj, attribute, new_text)
+            return
+    raise AttributeError(f"Object type {getattr(obj, 'ObjectName', type(obj).__name__)} has no editable text property.")
+
+
+def set_table_cell_style(table, row, col, style):
+    method = getattr(table, "SetCellStyle", None)
+    if method is None:
+        return False
+    try:
+        method(row, col, style)
+        return True
+    except Exception:
+        return False
+
+
+def set_table_cell_text(table, row, col, value):
+    value = str(value)
+
+    for method_name in ("SetCellValueFromText", "SetCellValue", "SetText"):
+        method = getattr(table, method_name, None)
+        if method is None:
+            continue
+        try:
+            method(row, col, value)
+            return
+        except TypeError:
+            try:
+                method(row, col, value, 0)
+                return
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    raise AttributeError(f"Table object {type(table).__name__} does not support setting cell values.")
+
+
+def set_table_cell_text_height(table, row, col, height):
+    method = getattr(table, "SetCellTextHeight", None)
+    if method is None:
+        return False
+    try:
+        method(row, col, float(height))
+        return True
+    except TypeError:
+        try:
+            method(row, col, float(height), 0)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def update_rev_texts(doc, manufacturing_rev_letter=None):
+    updated = []
+    for obj in iter_document_objects(doc):
+        try:
+            object_name = getattr(obj, "ObjectName", "")
+            if object_name.startswith("AcDbText") or object_name.startswith("AcDbMText"):
+                text = get_object_text(obj)
+                if not text:
+                    continue
+                old_letter = extract_rev_suffix(text)
+                if old_letter is None:
+                    continue
+                new_letter = (manufacturing_rev_letter if manufacturing_rev_letter is not None
+                              else bump_rev_letter(old_letter))
+                new_text = replace_rev_suffix(text, old_letter, new_letter)
+                set_object_text(obj, new_text)
+                updated.append((text, new_text))
+        except Exception:
+            continue
+    return updated
+
+
+def process_dxf(filepath, new_rev_name):
+    filepath = str(Path(filepath).resolve())
+    acad = find_acad_application()
+    has_manufacturing_rev, has_rev_table = check_dxf(filepath)
+    if not has_manufacturing_rev:
+        raise RuntimeError("No manufacturing rev text (Rev A/B/C style) was found in the drawing.")
+    if not has_rev_table:
+        raise RuntimeError("No REV table was found in the drawing.")
+
+    working_filepath = archive_dxf(filepath)
+    doc = acad.Documents.Open(working_filepath)
+
+    try:
+        manufacturing_rev = None
+        if new_rev_name is not None:
+            manufacturing_rev = normalize_rev_name(new_rev_name)
+
+        updated = update_rev_texts(doc, manufacturing_rev)
+
+        table = find_rev_table(doc)
+        max_doc_rev = get_max_table_rev_letter(table)
+        next_doc_rev = "A" if max_doc_rev is None else bump_rev_letter(max_doc_rev)
+        add_rev_table_entry(table, next_doc_rev, new_rev_name)
+        save_document(doc, working_filepath)
+        return {
+            "updated": updated,
+            "manufacturing_rev": new_rev_name,
+            "document_rev": next_doc_rev,
+        }
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:
+            pass
+
