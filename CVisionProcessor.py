@@ -2,19 +2,51 @@ import os
 import pathlib
 import re
 import shutil
-import sys
 from datetime import datetime
 from pathlib import Path, WindowsPath
-from tkinter import messagebox, simpledialog
+
 from dotenv import load_dotenv
 
 load_dotenv()
-
 
 try:
     import win32com.client
 except ImportError:  # pragma: no cover - only needed when AutoCAD COM is unavailable.
     win32com = None
+
+
+def get_env_path():
+    return Path(__file__).resolve().with_name(".env")
+
+
+def read_env_file():
+    env_path = get_env_path()
+    values = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if not line or line.strip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def write_env_value(key, value):
+    env_path = get_env_path()
+    values = read_env_file()
+    values[key] = str(value)
+    lines = [f"{key}={values[key]}" for key in sorted(values)]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def show_message_box(title, message, level="info"):
+    print(f"{title}: {message}")
+
+
+def confirm_message_box(title, message):
+    print(f"{title}: {message}")
+    return True
+
 
 REV_TEXT_PATTERN = re.compile(r"(?i)(?:^|[^A-Z])REV(?:[\s_-])?([A-Z])\s*$")
 _ACAD_APP = None
@@ -75,12 +107,11 @@ def archive_dxf(filepath):
     incremented_filepath = get_incremented_file_path(filepath)
 
     if os.path.exists(incremented_filepath):
-        messagebox.showerror("Error", f"File '{incremented_filepath}' already exists.")
+        show_message_box("Error", f"File '{incremented_filepath}' already exists.", "error")
         return ""
 
     if os.path.exists(archive_filepath):
-        user_response = messagebox.askyesno("Are You Sure?",
-                                            f"Directory '{archive_filepath}' already exists. Overwrite?")
+        user_response = confirm_message_box("Are You Sure?", f"Directory '{archive_filepath}' already exists. Overwrite?")
         if not user_response:
             return ""
     shutil.copy(filepath, archive_filepath)
@@ -495,4 +526,5 @@ def process_dxf(filepath, new_rev_name):
                 doc.Close(False)
         except Exception:
             pass
+
 
