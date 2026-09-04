@@ -23,6 +23,7 @@ from CVisionProcessor import (
     normalize_rev_name,
     process_dxf,
     read_env_file,
+    validate_filename_revs,
     write_env_value,
 )
 
@@ -166,13 +167,19 @@ class CVisionProcessorWindow(QWidget):
             show_message_box("No Files Selected", "Choose at least one DXF file to process.", "warning")
             return
 
+        try:
+            validate_filename_revs(selected_paths)
+        except ValueError as exc:
+            show_message_box("Invalid File Name", str(exc), "error")
+            return
+
         write_env_value("DEFAULT_PATH", folder_path)
         write_env_value("USER_INITIALS", initials_value)
 
         successful_files = 0
         for file_path in selected_paths:
             try:
-                process_dxf(str(file_path), rev_value)
+                process_dxf(str(file_path), rev_value, initials_value)
                 successful_files += 1
             except Exception as exc:
                 show_message_box("Processing Error", f"Failed to process '{file_path.name}': {exc}", "error")

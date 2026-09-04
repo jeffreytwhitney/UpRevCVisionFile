@@ -48,11 +48,16 @@ def confirm_message_box(title, message):
     return True
 
 
-REV_TEXT_PATTERN = re.compile(r"(?i)(?:^|[^A-Z])REV(?:[\s_-])?([A-Z])\s*$")
+REV_TEXT_PATTERN = re.compile(r"(?i)(?:^|[^A-Z])REV(?:[\s_-])?([A-Z]{1,2})\s*$")
+FILENAME_REV_SUFFIX_PATTERN = re.compile(r"_(?P<rev>[A-Z]{1,2})$")
 _ACAD_APP = None
 
 
-def add_rev_table_entry(table, doc_rev_letter, manufacturing_rev_letter):
+def add_rev_table_entry(table, doc_rev_letter, manufacturing_rev_letter, initials=None):
+    initials = (initials or read_env_file().get("USER_INITIALS", "").strip() or "").strip()
+    if not initials:
+        raise ValueError("USER_INITIALS is required before adding the REV table entry.")
+
     row_count = int(getattr(table, "Rows", 0))
     last_data_row = find_last_data_row(table)
 
@@ -90,7 +95,7 @@ def add_rev_table_entry(table, doc_rev_letter, manufacturing_rev_letter):
         elif col_index == 1:
             value = f"Up Rev to {manufacturing_rev_letter}. No chg."
         elif col_index == 2:
-            value = "JTW"
+            value = initials
         elif col_index == 3:
             value = datetime.now().strftime("%m/%d/%Y")
         set_table_cell_text(table, insert_row_index, col_index, value)
@@ -121,12 +126,20 @@ def archive_dxf(filepath):
 
 
 def bump_rev_letter(letter):
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    index = alphabet.find(letter.upper())
-    if index < 0:
-        raise ValueError(f"Unsupported rev letter: {letter!r}")
-    next_letter = alphabet[(index + 1) % len(alphabet)]
-    return next_letter if letter.isupper() else next_letter.lower()
+    normalized = normalize_rev_name(letter)
+    value = 0
+    for character in normalized:
+        value = (value * 26) + (ord(character) - ord("A") + 1)
+
+    value += 1
+    result = ""
+    while value > 0:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(ord("A") + remainder) + result
+
+    if len(result) > 2:
+        raise ValueError(f"Rev increment exceeds supported range for {letter!r}.")
+    return result
 
 
 def check_dxf(filepath):
@@ -164,6 +177,24 @@ def extract_rev_suffix(text):
     if not match:
         return None
     return match.group(1).upper()
+
+
+def extract_filename_rev(filepath):
+    stem = Path(filepath).stem
+    match = FILENAME_REV_SUFFIX_PATTERN.search(stem.upper())
+    if not match:
+        return None
+    return match.group("rev")
+
+
+def validate_filename_revs(filepaths):
+    invalid_files = [Path(filepath).name for filepath in filepaths if extract_filename_rev(filepath) is None]
+    if invalid_files:
+        joined = ", ".join(sorted(invalid_files))
+        raise ValueError(
+            "Each file name must end with an underscore followed by one or two rev characters before the .dxf extension. "
+            f"Invalid file(s): {joined}"
+        )
 
 
 def find_acad_application():
@@ -237,9 +268,14 @@ def find_rev_table(doc):
 
 def get_incremented_file_path(source_filepath):
     source_path = WindowsPath(source_filepath)
-    root_filename = source_path.stem[:len(source_path.stem) - 1]
+    match = FILENAME_REV_SUFFIX_PATTERN.search(source_path.stem.upper())
+    if not match:
+        raise ValueError(
+            f"File '{source_path.name}' must end with an underscore followed by one or two rev characters."
+        )
+    current_file_suffix = match.group("rev")
+    root_filename = source_path.stem[:-len(current_file_suffix)]
     file_extension = source_path.suffix
-    current_file_suffix = source_path.stem[-1]
     while True:
         incremented_file_suffix = get_incremented_file_suffix(current_file_suffix)
         incremented_filename = root_filename + incremented_file_suffix + file_extension
@@ -253,15 +289,12 @@ def get_incremented_file_path(source_filepath):
 
 
 def get_file_archive_path(source_filepath):
-    output_path_root = r"V:\Inspect Programs\C-Vision\Archived DXFs"
+    output_path_root = read_env_file().get("ARCHIVE_ROOT_PATH", "").strip()
     return pathlib.Path.joinpath(pathlib.WindowsPath(output_path_root), pathlib.WindowsPath(source_filepath).name)
 
 
 def get_incremented_file_suffix(file_suffix):
-    return_value = chr(ord(file_suffix) + 1)
-    if return_value == "[":
-        return_value = "AA"
-    return return_value
+    return bump_rev_letter(file_suffix)
 
 
 def get_max_table_rev_letter(table):
@@ -274,7 +307,7 @@ def get_max_table_rev_letter(table):
             continue
         if value.strip().upper() == "REV":
             continue
-        match = re.search(r"(?i)(?:^|[\s_])?([A-Z])$", value.strip())
+        match = re.search(r"(?i)(?:^|[\s_])?([A-Z]{1,2})$", value.strip())
         if not match:
             continue
         letter = match.group(1).upper()
@@ -365,23 +398,20 @@ def normalize_rev_name(rev_name):
     cleaned = str(rev_name).strip()
     if not cleaned:
         raise ValueError("A new rev name is required.")
-
-    cleaned = re.sub(r"(?i)^REV[\s_-]*", "", cleaned)
-    cleaned = cleaned.strip()
-    if not re.fullmatch(r"[A-Z]", cleaned.upper()):
-        raise ValueError(f"Unsupported rev name: {rev_name!r}. Use a single letter such as A, B, or C.")
+    if not re.fullmatch(r"[A-Za-z]{1,2}", cleaned):
+        raise ValueError("Rev values must be one or two letters.")
 
     return cleaned.upper()
 
 
 def replace_rev_suffix(text, old_letter, new_letter):
-    match = re.search(r"(?i)(REV)([\s_-]?)\s*([A-Z])\s*$", text)
+    match = re.search(r"(?i)(REV)([\s_-]?)\s*([A-Z]{1,2})\s*$", text)
     if match is None:
         pattern = re.compile(rf"(?i)(REV)(?:[\s_-])?{re.escape(old_letter)}\s*$")
         return pattern.sub(lambda match: f"{match.group(1)} {new_letter}", text, count=1)
 
     separator = match.group(2) or " "
-    return re.sub(r"(?i)(REV)([\s_-]?)\s*[A-Z]\s*$", rf"\1{separator}{new_letter}", text, count=1)
+    return re.sub(r"(?i)(REV)([\s_-]?)\s*[A-Z]{1,2}\s*$", rf"\1{separator}{new_letter}", text, count=1)
 
 
 def save_document(doc, filepath):
@@ -491,8 +521,13 @@ def update_rev_texts(doc, manufacturing_rev_letter=None):
     return updated
 
 
-def process_dxf(filepath, new_rev_name):
+def process_dxf(filepath, new_rev_name, initials=None):
     filepath = str(Path(filepath).resolve())
+    validate_filename_revs([filepath])
+    initials = (initials or read_env_file().get("USER_INITIALS", "").strip() or "").strip()
+    if not initials:
+        raise ValueError("USER_INITIALS is required before processing DXF files.")
+
     acad = find_acad_application()
     has_manufacturing_rev, has_rev_table = check_dxf(filepath)
     if not has_manufacturing_rev:
@@ -512,8 +547,8 @@ def process_dxf(filepath, new_rev_name):
 
         table = find_rev_table(doc)
         max_doc_rev = get_max_table_rev_letter(table)
-        next_doc_rev = "A" if max_doc_rev is None else bump_rev_letter(max_doc_rev)
-        add_rev_table_entry(table, next_doc_rev, new_rev_name)
+        next_doc_rev = "AA" if max_doc_rev is None else bump_rev_letter(max_doc_rev)
+        add_rev_table_entry(table, next_doc_rev, new_rev_name, initials=initials)
         save_document(doc, working_filepath)
         return {
             "updated": updated,
@@ -526,5 +561,4 @@ def process_dxf(filepath, new_rev_name):
                 doc.Close(False)
         except Exception:
             pass
-
 
