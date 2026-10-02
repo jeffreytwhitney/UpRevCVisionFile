@@ -1,6 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -45,6 +45,23 @@ def test_process_dxf_errors_when_no_table_found(monkeypatch, tmp_path):
         processor.process_dxf(str(file_path), "B")
 
 
+def test_add_rev_table_entry_sets_requested_cell_alignments():
+    table = Mock()
+    table.Rows = 1
+    table.Columns = 4
+    table.GetCellValue.side_effect = lambda row, col: "REV" if (row, col) == (0, 0) else ""
+
+    row = processor.add_rev_table_entry(table, "A", "B", initials="JT")
+
+    assert row == 1
+    assert table.SetCellAlignment.call_args_list == [
+        call(1, 0, processor.AC_CELL_ALIGNMENT_TOP_CENTER),
+        call(1, 1, processor.AC_CELL_ALIGNMENT_MIDDLE_LEFT),
+        call(1, 2, processor.AC_CELL_ALIGNMENT_TOP_CENTER),
+        call(1, 3, processor.AC_CELL_ALIGNMENT_TOP_CENTER),
+    ]
+
+
 def test_process_dxf_success_path(monkeypatch, tmp_path):
     file_path = tmp_path / "GoodFile_B.dxf"
     file_path.write_text("stub", encoding="utf-8")
@@ -69,4 +86,3 @@ def test_process_dxf_success_path(monkeypatch, tmp_path):
     assert result["manufacturing_rev"] == "C"
     assert result["document_rev"] == "B"
     assert result["updated"] == [("REV B", "REV C")]
-

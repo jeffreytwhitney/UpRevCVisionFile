@@ -51,6 +51,8 @@ def confirm_message_box(title, message):
 REV_TEXT_PATTERN = re.compile(r"(?i)(?:^|[^A-Z])REV(?:[\s_-])?([A-Z]{1,2})\s*$")
 FILENAME_REV_SUFFIX_PATTERN = re.compile(r"_(?P<rev>[A-Z]{1,2})$")
 _ACAD_APP = None
+AC_CELL_ALIGNMENT_TOP_CENTER = 2
+AC_CELL_ALIGNMENT_MIDDLE_LEFT = 4
 
 
 def add_rev_table_entry(table, doc_rev_letter, manufacturing_rev_letter, initials=None):
@@ -103,6 +105,10 @@ def add_rev_table_entry(table, doc_rev_letter, manufacturing_rev_letter, initial
             set_table_cell_style(table, insert_row_index, col_index, reference_style)
         elif reference_height is not None:
             set_table_cell_text_height(table, insert_row_index, col_index, reference_height)
+        alignment = (
+            AC_CELL_ALIGNMENT_MIDDLE_LEFT if col_index == 1 else AC_CELL_ALIGNMENT_TOP_CENTER
+        )
+        table.SetCellAlignment(insert_row_index, col_index, alignment)
 
     return insert_row_index
 
@@ -561,4 +567,3 @@ def process_dxf(filepath, new_rev_name, initials=None):
                 doc.Close(False)
         except Exception:
             pass
-
