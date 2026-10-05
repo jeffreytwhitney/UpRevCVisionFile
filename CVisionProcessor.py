@@ -2,6 +2,7 @@ import os
 import pathlib
 import re
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path, WindowsPath
 
@@ -32,7 +33,10 @@ def read_env_file():
             if not line or line.strip().startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            values[key.strip()] = value.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            values[key.strip()] = value
     return values
 
 
@@ -61,7 +65,7 @@ def confirm_message_box(title, message):
 
 REV_TEXT_PATTERN = re.compile(r"(?i)(?:^|[^A-Z])REV(?:[\s_-])?([A-Z]{1,2})\s*$")
 FILENAME_REV_SUFFIX_PATTERN = re.compile(r"_(?P<rev>[A-Z]{1,2})$")
-_ACAD_APP = None
+_ACAD_LOCAL = threading.local()  # COM objects cannot cross threads; cache per thread
 AC_CELL_ALIGNMENT_TOP_CENTER = 2
 AC_CELL_ALIGNMENT_MIDDLE_LEFT = 4
 
@@ -137,6 +141,7 @@ def archive_dxf(filepath):
         user_response = confirm_message_box("Are You Sure?", f"Directory '{archive_filepath}' already exists. Overwrite?")
         if not user_response:
             return ""
+    os.makedirs(os.path.dirname(archive_filepath), exist_ok=True)
     shutil.copy(filepath, archive_filepath)
     os.rename(filepath, incremented_filepath)
 
@@ -219,25 +224,25 @@ def validate_filename_revs(filepaths):
 
 
 def find_acad_application():
-    global _ACAD_APP
     if win32com is None:
         raise RuntimeError("pywin32 is required to communicate with AutoCAD.")
 
-    if _ACAD_APP is not None:
+    cached = getattr(_ACAD_LOCAL, "app", None)
+    if cached is not None:
         try:
-            if hasattr(_ACAD_APP, "Documents"):
-                return _ACAD_APP
+            if hasattr(cached, "Documents"):
+                return cached
         except Exception:
             logger.warning("Cached AutoCAD connection is stale", exc_info=True)
-            _ACAD_APP = None
+            _ACAD_LOCAL.app = None
 
     for app_name in ("AutoCAD.Application", "AutoCAD.Application.25.1"):
         try:
             app = win32com.client.GetActiveObject(app_name)
             if hasattr(app, "Documents"):
-                _ACAD_APP = app
+                _ACAD_LOCAL.app = app
                 logger.info("Attached to running %s", app_name)
-                return _ACAD_APP
+                return app
         except Exception:
             logger.debug("%s is not a running/registered AutoCAD ProgID", app_name)
 
@@ -245,9 +250,9 @@ def find_acad_application():
         try:
             app = win32com.client.Dispatch(app_name)
             if hasattr(app, "Documents"):
-                _ACAD_APP = app
+                _ACAD_LOCAL.app = app
                 logger.info("Started new %s", app_name)
-                return _ACAD_APP
+                return app
         except Exception:
             logger.warning("Dispatch failed for %s", app_name, exc_info=True)
 

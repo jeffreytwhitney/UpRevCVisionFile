@@ -1,8 +1,9 @@
 ﻿import os
 import sys
+import threading
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -225,50 +226,114 @@ class CVisionProcessorWindow(QWidget):
 
         total = len(selected_paths)
         logger.info("Processing %d file(s), rev=%s", total, rev_value)
-        progress = QProgressDialog("Starting...", "Cancel", 0, total, self)
-        progress.setWindowTitle("Processing")
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.setValue(0)
+
+        self._progress = QProgressDialog("Starting...", "Cancel", 0, total, self)
+        self._progress.setWindowTitle("Processing")
+        self._progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._progress.setMinimumDuration(0)
+        self._progress.setAutoClose(False)
+        self._progress.setAutoReset(False)
+        self._progress.setValue(0)
+
+        self._thread = QThread()
+        self._worker = ProcessWorker(selected_paths, rev_value, initials_value)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_worker_progress)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._progress.canceled.connect(self._on_cancel_requested)
+
         self.execute_button.setEnabled(False)
+        self._progress.show()
+        self._thread.start()
 
-        successful_files = 0
-        cancelled = False
-        try:
-            for index, file_path in enumerate(selected_paths, start=1):
-                progress.setLabelText(f"Processing file {index} of {total}\n{file_path.name}")
-                QApplication.processEvents()
-                if progress.wasCanceled():
-                    cancelled = True
-                    break
-                try:
-                    process_dxf(str(file_path), rev_value, initials_value)
-                    successful_files += 1
-                except Exception as exc:
-                    logger.exception("Failed processing %s", file_path)
-                    progress.hide()
-                    show_message_box("Processing Error", f"Failed to process '{file_path.name}': {exc}", "error")
-                    progress.show()
-                progress.setValue(index)
-                QApplication.processEvents()
-                if progress.wasCanceled() and index < total:
-                    cancelled = True
-                    break
-        finally:
-            progress.close()
-            self.execute_button.setEnabled(True)
+    def _on_worker_progress(self, index, total, name):
+        self._progress.setLabelText(f"Processing file {index} of {total}\n{name}")
+        self._progress.setValue(index - 1)
 
-        if cancelled:
-            logger.info("Processing cancelled after %d file(s)", successful_files)
+    def _on_cancel_requested(self):
+        logger.info("Cancel requested by user")
+        self._worker.cancel()
+        self._progress.setLabelText("Cancelling after the current file finishes...")
+        self._progress.show()
+
+    def _on_worker_finished(self, successful_files, total, status, failed_name, error_text):
+        self._progress.canceled.disconnect(self._on_cancel_requested)
+        self._progress.close()
+        self._thread.wait()
+        self.execute_button.setEnabled(True)
+        logger.info("Processing finished: status=%s, %d/%d succeeded", status, successful_files, total)
+
+        if status == "failed":
+            show_message_box(
+                "Processing Error",
+                f"Failed to process '{failed_name}': {error_text}\n\n"
+                f"Processing stopped. {successful_files} of {total} file(s) were processed before the error.",
+                "error",
+            )
+        elif status == "cancelled":
             show_message_box(
                 "Processing Cancelled",
                 f"Cancelled. Processed {successful_files} of {total} file(s) before stopping.",
                 "warning",
             )
-        elif successful_files:
+        else:
             show_message_box("Processing Complete", f"Processed {successful_files} file(s) successfully.", "info")
+
+
+class ProcessWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(int, int, str, str, str)
+
+    def __init__(self, paths, rev_value, initials_value):
+        super().__init__()
+        self._paths = paths
+        self._rev_value = rev_value
+        self._initials_value = initials_value
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def run(self):
+        total = len(self._paths)
+        successful = 0
+        status = "done"
+        failed_name = ""
+        error_text = ""
+        com_initialized = False
+        try:
+            try:
+                import pythoncom
+
+                pythoncom.CoInitialize()
+                com_initialized = True
+            except ImportError:
+                pass
+
+            for index, file_path in enumerate(self._paths, start=1):
+                if self._cancel_event.is_set():
+                    status = "cancelled"
+                    break
+                self.progress.emit(index, total, file_path.name)
+                try:
+                    process_dxf(str(file_path), self._rev_value, self._initials_value)
+                    successful += 1
+                except Exception as exc:
+                    logger.exception("Failed processing %s", file_path)
+                    status = "failed"
+                    failed_name = file_path.name
+                    error_text = str(exc)
+                    break
+        except Exception as exc:
+            logger.exception("Worker crashed")
+            status = "failed"
+            error_text = str(exc)
+        finally:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+            self.finished.emit(successful, total, status, failed_name, error_text)
 
 
 def main():
