@@ -7,7 +7,11 @@ from pathlib import Path, WindowsPath
 
 from dotenv import load_dotenv
 
-load_dotenv()
+from app_logging import get_app_dir, get_logger
+
+logger = get_logger("processor")
+
+load_dotenv(get_app_dir() / ".env")
 
 try:
     import win32com.client
@@ -16,12 +20,13 @@ except ImportError:  # pragma: no cover - only needed when AutoCAD COM is unavai
 
 
 def get_env_path():
-    return Path(__file__).resolve().with_name(".env")
+    return get_app_dir() / ".env"
 
 
 def read_env_file():
     env_path = get_env_path()
     values = {}
+    logger.debug("Reading env file %s", env_path)
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             if not line or line.strip().startswith("#") or "=" not in line:
@@ -36,10 +41,16 @@ def write_env_value(key, value):
     values = read_env_file()
     values[key] = str(value)
     lines = [f"{key}={values[key]}" for key in sorted(values)]
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        logger.exception("Unable to write %s to %s", key, env_path)
+        raise
+    logger.info("Saved setting %s", key)
 
 
 def show_message_box(title, message, level="info"):
+    logger.info("Message [%s] %s: %s", level, title, message)
     print(f"{title}: {message}")
 
 
@@ -117,6 +128,7 @@ def archive_dxf(filepath):
     archive_filepath = get_file_archive_path(filepath)
     incremented_filepath = get_incremented_file_path(filepath)
 
+    logger.info("Archiving %s -> %s, renaming to %s", filepath, archive_filepath, incremented_filepath)
     if os.path.exists(incremented_filepath):
         show_message_box("Error", f"File '{incremented_filepath}' already exists.", "error")
         return ""
@@ -152,6 +164,7 @@ def check_dxf(filepath):
     has_rev_text = False
     has_rev_table = False
 
+    logger.info("Checking %s", filepath)
     acad = find_acad_application()
     doc = acad.Documents.Open(filepath)
     try:
@@ -167,14 +180,16 @@ def check_dxf(filepath):
                     if cell_text.upper() == "REV":
                         has_rev_table = True
             except Exception:
+                logger.debug("Skipping unreadable object during check", exc_info=True)
                 continue
     finally:
         try:
             if doc is not None:
                 doc.Close(False)
         except Exception:
-            pass
+            logger.warning("Failed closing %s after check", filepath, exc_info=True)
 
+    logger.info("Check result for %s: rev_text=%s rev_table=%s", filepath, has_rev_text, has_rev_table)
     return has_rev_text, has_rev_table
 
 
@@ -213,6 +228,7 @@ def find_acad_application():
             if hasattr(_ACAD_APP, "Documents"):
                 return _ACAD_APP
         except Exception:
+            logger.warning("Cached AutoCAD connection is stale", exc_info=True)
             _ACAD_APP = None
 
     for app_name in ("AutoCAD.Application", "AutoCAD.Application.25.1"):
@@ -220,19 +236,22 @@ def find_acad_application():
             app = win32com.client.GetActiveObject(app_name)
             if hasattr(app, "Documents"):
                 _ACAD_APP = app
+                logger.info("Attached to running %s", app_name)
                 return _ACAD_APP
         except Exception:
-            pass
+            logger.debug("%s is not a running/registered AutoCAD ProgID", app_name)
 
     for app_name in ("AutoCAD.Application", "AutoCAD.Application.25.1"):
         try:
             app = win32com.client.Dispatch(app_name)
             if hasattr(app, "Documents"):
                 _ACAD_APP = app
+                logger.info("Started new %s", app_name)
                 return _ACAD_APP
         except Exception:
-            pass
+            logger.warning("Dispatch failed for %s", app_name, exc_info=True)
 
+    logger.error("AutoCAD unavailable")
     raise RuntimeError("AutoCAD is not running, and a new instance could not be started.")
 
 
@@ -428,6 +447,7 @@ def save_document(doc, filepath):
     temp_path = temp_dir / temp_name
 
     try:
+        logger.info("Saving %s via %s", file_path, temp_path)
         doc.SaveAs(str(temp_path))
         try:
             doc.Close(False)
@@ -437,6 +457,7 @@ def save_document(doc, filepath):
             os.replace(str(temp_path), str(file_path))
         return
     except Exception as exc:
+        logger.exception("Save failed for %s", filepath)
         if temp_path.exists():
             try:
                 temp_path.unlink()
@@ -521,13 +542,16 @@ def update_rev_texts(doc, manufacturing_rev_letter=None):
                               else bump_rev_letter(old_letter))
                 new_text = replace_rev_suffix(text, old_letter, new_letter)
                 set_object_text(obj, new_text)
+                logger.info("Rev text updated: %r -> %r", text, new_text)
                 updated.append((text, new_text))
         except Exception:
+            logger.warning("Failed updating a rev text object", exc_info=True)
             continue
     return updated
 
 
 def process_dxf(filepath, new_rev_name, initials=None):
+    logger.info("process_dxf start: %s rev=%s", filepath, new_rev_name)
     filepath = str(Path(filepath).resolve())
     validate_filename_revs([filepath])
     initials = (initials or read_env_file().get("USER_INITIALS", "").strip() or "").strip()
@@ -542,6 +566,8 @@ def process_dxf(filepath, new_rev_name, initials=None):
         raise RuntimeError("No REV table was found in the drawing.")
 
     working_filepath = archive_dxf(filepath)
+    if not working_filepath:
+        raise RuntimeError("The file could not be archived (target already exists or overwrite declined).")
     doc = acad.Documents.Open(working_filepath)
 
     try:
@@ -556,14 +582,19 @@ def process_dxf(filepath, new_rev_name, initials=None):
         next_doc_rev = "AA" if max_doc_rev is None else bump_rev_letter(max_doc_rev)
         add_rev_table_entry(table, next_doc_rev, new_rev_name, initials=initials)
         save_document(doc, working_filepath)
+        doc = None  # save_document already closed it
+        logger.info("process_dxf done: %s (doc rev %s)", working_filepath, next_doc_rev)
         return {
             "updated": updated,
             "manufacturing_rev": new_rev_name,
             "document_rev": next_doc_rev,
         }
+    except Exception:
+        logger.exception("process_dxf failed for %s", filepath)
+        raise
     finally:
         try:
             if doc is not None:
                 doc.Close(False)
         except Exception:
-            pass
+            logger.debug("Close after save raised (document likely already closed)", exc_info=True)

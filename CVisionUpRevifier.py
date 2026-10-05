@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 from pathlib import Path
 
@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -19,7 +20,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app_logging import get_logger, setup_logging
 from CVisionProcessor import (
+    find_acad_application,
     normalize_rev_name,
     process_dxf,
     read_env_file,
@@ -28,7 +31,11 @@ from CVisionProcessor import (
 )
 
 
+logger = get_logger("ui")
+
+
 def show_message_box(title, message, level="info"):
+    logger.info("Message [%s] %s: %s", level, title, message)
     box = QMessageBox()
     box.setWindowTitle(title)
     box.setText(message)
@@ -87,21 +94,48 @@ class CVisionProcessorWindow(QWidget):
         self.refresh_file_table()
 
     def load_defaults(self):
-        values = read_env_file()
-        self.input_folder_edit.setText(values.get("DEFAULT_PATH", "").strip())
-        self.initials_edit.setText(values.get("USER_INITIALS", "").strip())
+        try:
+            values = read_env_file()
+            self.input_folder_edit.setText(values.get("DEFAULT_PATH", "").strip())
+            self.initials_edit.setText(values.get("USER_INITIALS", "").strip())
+        except Exception:
+            logger.exception("Failed loading defaults")
 
     def choose_input_folder(self):
-        starting_path = self.input_folder_edit.text().strip() or os.getcwd()
-        selected_folder = QFileDialog.getExistingDirectory(self, "Select Input Folder", starting_path)
-        if not selected_folder:
-            return
-        self.input_folder_edit.setText(selected_folder)
-        write_env_value("DEFAULT_PATH", selected_folder)
-        self.refresh_file_table()
+        try:
+            starting_path = self.input_folder_edit.text().strip()
+            if not starting_path or not os.path.isdir(starting_path):
+                starting_path = os.getcwd()
+            logger.info("Choosing input folder, starting at %s", starting_path)
+            selected_folder = QFileDialog.getExistingDirectory(self, "Select Input Folder", starting_path)
+            if not selected_folder:
+                logger.info("Folder selection cancelled")
+                return
+            logger.info("Input folder selected: %s", selected_folder)
+            self.input_folder_edit.setText(selected_folder)
+            try:
+                write_env_value("DEFAULT_PATH", selected_folder)
+            except Exception:
+                show_message_box(
+                    "Settings Not Saved",
+                    "The selected folder could not be remembered for next time. See error.log for details.",
+                    "warning",
+                )
+            self.refresh_file_table()
+        except Exception:
+            logger.exception("Failed choosing input folder")
+            show_message_box("Error", "Unable to change the input folder. See error.log for details.", "error")
 
     def refresh_file_table(self):
+        try:
+            self._refresh_file_table()
+        except Exception:
+            logger.exception("Failed refreshing file table")
+            show_message_box("Error", "Unable to list the DXF files in that folder. See error.log for details.", "error")
+
+    def _refresh_file_table(self):
         folder_path = self.input_folder_edit.text().strip()
+        logger.info("Refreshing file table for %s", folder_path)
         self.file_table.setRowCount(0)
         if not folder_path or not os.path.isdir(folder_path):
             self.select_all_checkbox.setChecked(False)
@@ -134,6 +168,13 @@ class CVisionProcessorWindow(QWidget):
                 item.setCheckState(state)
 
     def execute_selected_files(self):
+        try:
+            self._execute_selected_files()
+        except Exception:
+            logger.exception("Unexpected failure while executing")
+            show_message_box("Error", "An unexpected error occurred. See error.log for details.", "error")
+
+    def _execute_selected_files(self):
         folder_path = self.input_folder_edit.text().strip()
         if not folder_path or not os.path.isdir(folder_path):
             show_message_box("Input Folder Required", "Select a valid input folder before executing.", "warning")
@@ -176,23 +217,73 @@ class CVisionProcessorWindow(QWidget):
         write_env_value("DEFAULT_PATH", folder_path)
         write_env_value("USER_INITIALS", initials_value)
 
-        successful_files = 0
-        for file_path in selected_paths:
-            try:
-                process_dxf(str(file_path), rev_value, initials_value)
-                successful_files += 1
-            except Exception as exc:
-                show_message_box("Processing Error", f"Failed to process '{file_path.name}': {exc}", "error")
+        try:
+            find_acad_application()
+        except Exception as exc:
+            show_message_box("AutoCAD Error", str(exc), "error")
+            return
 
-        if successful_files:
+        total = len(selected_paths)
+        logger.info("Processing %d file(s), rev=%s", total, rev_value)
+        progress = QProgressDialog("Starting...", "Cancel", 0, total, self)
+        progress.setWindowTitle("Processing")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        self.execute_button.setEnabled(False)
+
+        successful_files = 0
+        cancelled = False
+        try:
+            for index, file_path in enumerate(selected_paths, start=1):
+                progress.setLabelText(f"Processing file {index} of {total}\n{file_path.name}")
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+                try:
+                    process_dxf(str(file_path), rev_value, initials_value)
+                    successful_files += 1
+                except Exception as exc:
+                    logger.exception("Failed processing %s", file_path)
+                    progress.hide()
+                    show_message_box("Processing Error", f"Failed to process '{file_path.name}': {exc}", "error")
+                    progress.show()
+                progress.setValue(index)
+                QApplication.processEvents()
+                if progress.wasCanceled() and index < total:
+                    cancelled = True
+                    break
+        finally:
+            progress.close()
+            self.execute_button.setEnabled(True)
+
+        if cancelled:
+            logger.info("Processing cancelled after %d file(s)", successful_files)
+            show_message_box(
+                "Processing Cancelled",
+                f"Cancelled. Processed {successful_files} of {total} file(s) before stopping.",
+                "warning",
+            )
+        elif successful_files:
             show_message_box("Processing Complete", f"Processed {successful_files} file(s) successfully.", "info")
 
 
 def main():
-    app = QApplication(sys.argv)
-    window = CVisionProcessorWindow()
-    window.show()
-    return app.exec()
+    setup_logging()
+    logger.info("Application starting")
+    try:
+        app = QApplication(sys.argv)
+        window = CVisionProcessorWindow()
+        window.show()
+        result = app.exec()
+        logger.info("Application exited with code %s", result)
+        return result
+    except Exception:
+        logger.critical("Fatal error in main", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

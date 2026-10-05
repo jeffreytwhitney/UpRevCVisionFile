@@ -37,6 +37,7 @@ def test_execute_selected_files_success_calls_processor(qtbot, monkeypatch, tmp_
     monkeypatch.setattr(ui, "read_env_file", lambda: {"DEFAULT_PATH": str(tmp_path), "USER_INITIALS": "JT"})
     monkeypatch.setattr(ui, "validate_filename_revs", lambda paths: None)
     calls = []
+    monkeypatch.setattr(ui, "find_acad_application", lambda: object())
     monkeypatch.setattr(ui, "process_dxf", lambda path, rev, initials: calls.append((Path(path).name, rev, initials)))
     messages = []
     monkeypatch.setattr(ui, "show_message_box", lambda t, m, l="info": messages.append((t, m, l)))
