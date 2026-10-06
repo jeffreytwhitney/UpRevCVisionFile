@@ -23,7 +23,6 @@ from PyQt6.QtWidgets import (
 
 from app_logging import get_logger, setup_logging
 from CVisionProcessor import (
-    find_acad_application,
     normalize_rev_name,
     process_dxf,
     read_env_file,
@@ -218,12 +217,6 @@ class CVisionProcessorWindow(QWidget):
         write_env_value("DEFAULT_PATH", folder_path)
         write_env_value("USER_INITIALS", initials_value)
 
-        try:
-            find_acad_application()
-        except Exception as exc:
-            show_message_box("AutoCAD Error", str(exc), "error")
-            return
-
         total = len(selected_paths)
         logger.info("Processing %d file(s), rev=%s", total, rev_value)
 
@@ -240,8 +233,8 @@ class CVisionProcessorWindow(QWidget):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_worker_progress)
+        self._worker.finished.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._worker.finished.connect(self._on_worker_finished)
-        self._worker.finished.connect(self._thread.quit)
         self._progress.canceled.connect(self._on_cancel_requested)
 
         self.execute_button.setEnabled(False)
@@ -302,13 +295,13 @@ class ProcessWorker(QObject):
         status = "done"
         failed_name = ""
         error_text = ""
-        com_initialized = False
+        com_uninitialize = None
         try:
             try:
                 import pythoncom
 
                 pythoncom.CoInitialize()
-                com_initialized = True
+                com_uninitialize = pythoncom.CoUninitialize
             except ImportError:
                 pass
 
@@ -320,6 +313,9 @@ class ProcessWorker(QObject):
                 try:
                     process_dxf(str(file_path), self._rev_value, self._initials_value)
                     successful += 1
+                    if self._cancel_event.is_set():
+                        status = "cancelled"
+                        break
                 except Exception as exc:
                     logger.exception("Failed processing %s", file_path)
                     status = "failed"
@@ -331,8 +327,8 @@ class ProcessWorker(QObject):
             status = "failed"
             error_text = str(exc)
         finally:
-            if com_initialized:
-                pythoncom.CoUninitialize()
+            if com_uninitialize is not None:
+                com_uninitialize()
             self.finished.emit(successful, total, status, failed_name, error_text)
 
 
