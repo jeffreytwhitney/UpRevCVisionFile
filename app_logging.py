@@ -27,8 +27,8 @@ def get_logger(name=None):
 
 def _resolve_log_level(logger):
     level_name = os.getenv("LOG_LEVEL", "DEBUG").strip().upper()
-    level = logging.getLevelName(level_name)
-    if isinstance(level, int):
+    level = logging.getLevelNamesMapping().get(level_name)
+    if level is not None:
         return level
     logger.warning("Invalid LOG_LEVEL %r; using DEBUG", level_name)
     return logging.DEBUG
