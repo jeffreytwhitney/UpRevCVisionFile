@@ -1,8 +1,11 @@
 import logging
+import os
 import sys
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 LOGGER_NAME = "uprev"
 _configured = False
@@ -22,12 +25,22 @@ def get_logger(name=None):
     return logging.getLogger(f"{LOGGER_NAME}.{name}" if name else LOGGER_NAME)
 
 
+def _resolve_log_level(logger):
+    level_name = os.getenv("LOG_LEVEL", "DEBUG").strip().upper()
+    level = logging.getLevelName(level_name)
+    if isinstance(level, int):
+        return level
+    logger.warning("Invalid LOG_LEVEL %r; using DEBUG", level_name)
+    return logging.DEBUG
+
+
 def setup_logging():
     global _configured
     if _configured:
         return get_logger()
     _configured = True
 
+    load_dotenv(get_app_dir() / ".env")
     logger = get_logger()
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -38,6 +51,7 @@ def setup_logging():
         handler = RotatingFileHandler(Path.home() / "error.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    logger.setLevel(_resolve_log_level(logger))
 
     def log_uncaught(exc_type, exc_value, exc_tb):
         if issubclass(exc_type, KeyboardInterrupt):

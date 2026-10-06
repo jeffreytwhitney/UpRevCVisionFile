@@ -26,9 +26,10 @@ Create a `.env` file beside `CVisionProcessor.py`:
 DEFAULT_PATH=C:\path\to\dxf-files
 ARCHIVE_ROOT_PATH=C:\path\to\archive
 USER_INITIALS=AB
+LOG_LEVEL=INFO
 ```
 
-`DEFAULT_PATH` and `USER_INITIALS` are loaded into the application when it starts and saved when changed. `ARCHIVE_ROOT_PATH` must point to an existing folder where source drawings can be archived.
+`DEFAULT_PATH` and `USER_INITIALS` are loaded into the application when it starts and saved when changed. `ARCHIVE_ROOT_PATH` must point to an existing folder where source drawings can be archived. `LOG_LEVEL` controls the minimum level written to the log and accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`; it defaults to `DEBUG`.
 
 ## Run
 
